@@ -6,7 +6,7 @@
   "description": "Bring your Windows desktop into your world with local, spatial app panels.",
   "icon": "assets/wincraft/icon.png",
   "authors": [
-    "WinCraft Desktop contributors"
+    "someone_9696"
   ],
   "environment": "client",
   "mixins": [
