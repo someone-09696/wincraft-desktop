@@ -1,0 +1,5 @@
+.gradle/
+build/
+run/
+native-build/
+src/main/resources/natives/windows-x86_64/wincraft_native.dll

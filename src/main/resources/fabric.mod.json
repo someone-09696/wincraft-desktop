@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "wincraft",
+  "version": "${version}",
+  "name": "WinCraft Desktop",
+  "description": "Bring your Windows desktop into your world with local, spatial app panels.",
+  "icon": "assets/wincraft/icon.png",
+  "authors": [
+    "WinCraft Desktop contributors"
+  ],
+  "environment": "client",
+  "mixins": [
+    "wincraft.mixins.json"
+  ],
+  "entrypoints": {
+    "main": [
+      "com.wincraft.WinCraftMod"
+    ],
+    "client": [
+      "com.wincraft.client.WinCraftClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "=26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "package": "com.wincraft.client.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "MouseHandlerMixin",
+    "KeyboardHandlerMixin",
+    "MinecraftMixin",
+    "GameRendererMixin",
+    "HudMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
