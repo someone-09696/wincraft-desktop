@@ -525,6 +525,7 @@ public final class WindowInputHandler {
         RaycastRay now = currentRay(mc);
 
         if (d.handle == Handle.MOVE) {
+            Vector3d oldOwnerPos = new Vector3d(d.panel.transform.position);
             Vector3d newPos = new Vector3d(now.origin()).fma(d.distance, now.direction());
 
             // Snap against block surfaces if looking towards a block
@@ -566,6 +567,15 @@ public final class WindowInputHandler {
                 Vec3 look = mc.player.getLookAngle();
                 d.panel.transform.pinToCamera(new Vector3d(eye.x, eye.y, eye.z),
                     new Vector3d(look.x, look.y, look.z), mc.player.getYRot(), mc.player.getXRot());
+            }
+
+            Vector3d moveDelta = new Vector3d(d.panel.transform.position).sub(oldOwnerPos);
+            for (AppWindowEntity other : WinCraftClient.surfaces()) {
+                if (other != d.panel && other.ownedPopup && other.ownerHwnd == d.panel.info.hwnd()) {
+                    other.transform.position.add(moveDelta);
+                    other.transform.yaw = d.panel.transform.yaw;
+                    other.transform.pitch = d.panel.transform.pitch;
+                }
             }
             return;
         }

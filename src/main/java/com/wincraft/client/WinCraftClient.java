@@ -130,30 +130,88 @@ public final class WinCraftClient implements ClientModInitializer {
         WindowInputHandler.release();
         Vec3 eye = mc.player.getEyePosition();
         Vec3 look = mc.player.getLookAngle().normalize();
-        double placementDistance = 2.4;
-        if (mc.level != null) {
-            Vec3 rayEnd = eye.add(look.scale(8.0));
-            var blockHit = mc.level.clip(new net.minecraft.world.level.ClipContext(
-                eye, rayEnd, net.minecraft.world.level.ClipContext.Block.COLLIDER,
-                net.minecraft.world.level.ClipContext.Fluid.NONE, mc.player));
-            if (blockHit.getType() != net.minecraft.world.phys.HitResult.Type.MISS) {
-                placementDistance = Math.min(placementDistance,
-                    Math.max(.35, eye.distanceTo(blockHit.getLocation()) - .35));
+
+        AppWindowEntity ownerPanel = null;
+        if (ownedPopup && ownerHwnd != 0) {
+            for (AppWindowEntity p : PANELS) {
+                if (p.info.hwnd() == ownerHwnd) {
+                    ownerPanel = p;
+                    break;
+                }
             }
         }
-        Vec3 pos = eye.add(look.scale(placementDistance));
-        float aspect = Math.clamp((float)info.height() / Math.max(1, info.width()), .25f, 2.0f);
+
+        MatrixTransform3D transform;
         boolean readOnly = isMinecraftWindow(info.hwnd());
-        MatrixTransform3D transform = new MatrixTransform3D(
-            new Vector3d(pos.x, pos.y, pos.z),
-            (float)Math.asin(Math.clamp(look.y, -1, 1)),
-            (float)Math.atan2(-look.x, -look.z), 0,
-            2.2f, Math.clamp(2.2f * aspect, .5f, 3.5f));
+
+        if (ownerPanel != null) {
+            // Place the popup 1 block in front of the actual owner window, facing the same direction
+            org.joml.Vector3d normal = new org.joml.Vector3d(0, 0, 1);
+            new org.joml.Matrix4d()
+                .rotateZ(ownerPanel.transform.roll)
+                .rotateY(ownerPanel.transform.yaw)
+                .rotateX(ownerPanel.transform.pitch)
+                .transformDirection(normal);
+            normal.normalize();
+
+            double offsetDistance = 1.0; // 1 block in front of the owner panel
+            org.joml.Vector3d pos = new org.joml.Vector3d(ownerPanel.transform.position)
+                .add(normal.x * offsetDistance, normal.y * offsetDistance, normal.z * offsetDistance);
+
+            // If the player is standing very close between the owner panel and 1.0 block, adjust so it stays visible
+            double distToEye = pos.distance(new org.joml.Vector3d(eye.x, eye.y, eye.z));
+            if (distToEye < 0.45) {
+                double ownerDist = ownerPanel.transform.position.distance(new org.joml.Vector3d(eye.x, eye.y, eye.z));
+                offsetDistance = Math.max(0.25, Math.min(1.0, ownerDist * 0.5));
+                pos = new org.joml.Vector3d(ownerPanel.transform.position)
+                    .add(normal.x * offsetDistance, normal.y * offsetDistance, normal.z * offsetDistance);
+            }
+
+            float aspect = Math.clamp((float)info.height() / Math.max(1, info.width()), .25f, 2.0f);
+            float popupWidth;
+            if (ownerPanel.info.width() > 0 && info.width() > 0) {
+                float ratio = (float)info.width() / (float)ownerPanel.info.width();
+                popupWidth = Math.clamp(ownerPanel.transform.width * ratio, 0.8f, ownerPanel.transform.width);
+            } else {
+                popupWidth = Math.clamp(ownerPanel.transform.width * 0.75f, 0.8f, 2.0f);
+            }
+            float popupHeight = Math.clamp(popupWidth * aspect, 0.4f, 3.0f);
+
+            transform = new MatrixTransform3D(
+                pos, ownerPanel.transform.pitch, ownerPanel.transform.yaw, ownerPanel.transform.roll,
+                popupWidth, popupHeight);
+
+            if (ownerPanel.transform.followCamera) {
+                transform.pinToCamera(new org.joml.Vector3d(eye.x, eye.y, eye.z),
+                    new org.joml.Vector3d(look.x, look.y, look.z),
+                    mc.player.getYRot(), mc.player.getXRot());
+            }
+        } else {
+            double placementDistance = 2.4;
+            if (mc.level != null) {
+                Vec3 rayEnd = eye.add(look.scale(8.0));
+                var blockHit = mc.level.clip(new net.minecraft.world.level.ClipContext(
+                    eye, rayEnd, net.minecraft.world.level.ClipContext.Block.COLLIDER,
+                    net.minecraft.world.level.ClipContext.Fluid.NONE, mc.player));
+                if (blockHit.getType() != net.minecraft.world.phys.HitResult.Type.MISS) {
+                    placementDistance = Math.min(placementDistance,
+                        Math.max(.35, eye.distanceTo(blockHit.getLocation()) - .35));
+                }
+            }
+            Vec3 pos = eye.add(look.scale(placementDistance));
+            float aspect = Math.clamp((float)info.height() / Math.max(1, info.width()), .25f, 2.0f);
+            transform = new MatrixTransform3D(
+                new Vector3d(pos.x, pos.y, pos.z),
+                (float)Math.asin(Math.clamp(look.y, -1, 1)),
+                (float)Math.atan2(-look.x, -look.z), 0,
+                2.2f, Math.clamp(2.2f * aspect, .5f, 3.5f));
+        }
+
         AppWindowEntity panel = new AppWindowEntity(info, transform, readOnly, ownedPopup, ownerHwnd);
         PANELS.add(panel);
         com.wincraft.client.render.TransformStorage.save(info.title(), transform);
         LOG.info("Placed '{}' in the world{}{}", info.title(),
-            readOnly ? " (read-only Minecraft view)" : "", ownedPopup ? " (owned dialog)" : "");
+            readOnly ? " (read-only Minecraft view)" : "", ownedPopup ? " (owned dialog in front of parent)" : "");
         return panel;
     }
 
@@ -179,6 +237,15 @@ public final class WinCraftClient implements ClientModInitializer {
         if (PANELS.isEmpty()) return;
         for (AppWindowEntity panel : PANELS) {
             if (panel.sourceClosed()) continue;
+            if (panel.ownedPopup && panel.ownerHwnd != 0) {
+                boolean ownerAlive = PANELS.stream().anyMatch(p -> p.info.hwnd() == panel.ownerHwnd && !p.sourceClosed());
+                if (!ownerAlive) {
+                    LOG.info("Owner window for popup '{}' was closed – detaching popup.", panel.info.title());
+                    panel.markSourceClosed();
+                    detach(panel);
+                    continue;
+                }
+            }
             try {
                 if (!NativeCaptureBridge.isWindowOpen(panel.info.hwnd())) {
                     LOG.info("Source window '{}' was closed from Windows – detaching panel.", panel.info.title());
