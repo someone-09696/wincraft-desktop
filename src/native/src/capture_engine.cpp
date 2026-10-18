@@ -1,6 +1,7 @@
 #include "capture_engine.h"
 #include "win32_helpers.h"
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi.h>
 #include <dwmapi.h>
 #include <gl/GL.h>
@@ -168,12 +169,13 @@ struct CaptureEngine::Impl {
     HWND hwnd{};
     com_ptr<ID3D11Device> device;
     com_ptr<ID3D11DeviceContext> immediate;
+    com_ptr<ID3D11Multithread> multithread;
     D3D::IDirect3DDevice winrt_device{nullptr};
     WGC::GraphicsCaptureItem item{nullptr};
     WGC::Direct3D11CaptureFramePool pool{nullptr};
     WGC::GraphicsCaptureSession session{nullptr};
     winrt::event_token token{};
-    // pending is a GPU texture (never Map/Readback). The event thread copies into it.
+    std::atomic<bool> closing{false};
     std::mutex mutex;
     com_ptr<ID3D11Texture2D> pending;
     com_ptr<ID3D11Texture2D> target;
@@ -198,6 +200,8 @@ struct CaptureEngine::Impl {
         return out;
     }
     void arrive(WGC::Direct3D11CaptureFramePool const& sender) {
+        if (closing.load(std::memory_order_acquire)) return;
+        if (!device || FAILED(device->GetDeviceRemovedReason())) return;
         try {
             auto frame = sender.TryGetNextFrame();
             if (!frame) return;
@@ -213,22 +217,30 @@ struct CaptureEngine::Impl {
                 if (source_desc.Width == static_cast<UINT>(size.Width) &&
                     source_desc.Height == static_cast<UINT>(size.Height)) {
                     std::lock_guard guard(mutex);
-                    if (pending_w != size.Width || pending_h != size.Height) {
-                        pending = make_texture(device.get(), size.Width, size.Height);
-                        pending_w = size.Width; pending_h = size.Height;
+                    if (!closing.load(std::memory_order_acquire)) {
+                        if (device && SUCCEEDED(device->GetDeviceRemovedReason())) {
+                            if (pending_w != size.Width || pending_h != size.Height) {
+                                pending = make_texture(device.get(), size.Width, size.Height);
+                                pending_w = size.Width; pending_h = size.Height;
+                            }
+                            if (pending && source) {
+                                immediate->CopyResource(pending.get(), source.get());
+                                ++serial;
+                            }
+                        }
                     }
-                    immediate->CopyResource(pending.get(), source.get());
-                    ++serial;
                 }
             }
             frame.Close();
+            if (closing.load(std::memory_order_acquire)) return;
             if (pool_size.Width != size.Width || pool_size.Height != size.Height) {
-                sender.Recreate(winrt_device, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
-                pool_size = size;
+                if (winrt_device && SUCCEEDED(device->GetDeviceRemovedReason())) {
+                    sender.Recreate(winrt_device, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+                    pool_size = size;
+                }
             }
         } catch (...) {
             // Frame pool can close/device can be lost asynchronously. Next frame may recover.
-            // TODO: report persistent device-loss to Java rather than silently retain last frame.
         }
     }
     void load_wgl() {
@@ -245,19 +257,24 @@ struct CaptureEngine::Impl {
     }
     bool release_binding() {
         if (locked) {
-            if (!unlock(wgl_device, 1, &wgl_object)) return false;
+            if (wgl_device && wgl_object && unlock) {
+                unlock(wgl_device, 1, &wgl_object);
+            }
             locked = false;
         }
         if (wgl_object) {
-            if (!unreg(wgl_device, wgl_object)) return false;
+            if (wgl_device && unreg) {
+                unreg(wgl_device, wgl_object);
+            }
             wgl_object = nullptr;
         }
-        target = nullptr; texture = 0;
+        target = nullptr;
+        texture = 0;
         return true;
     }
 };
 
-CaptureEngine::CaptureEngine(HWND hwnd) : impl_(std::make_unique<Impl>()) {
+CaptureEngine::CaptureEngine(HWND hwnd) : impl_(std::make_shared<Impl>()) {
     require(IsWindow(hwnd), "Window invalid");
     if (IsIconic(hwnd)) {
         ShowWindow(hwnd, SW_RESTORE);
@@ -283,6 +300,12 @@ CaptureEngine::CaptureEngine(HWND hwnd) : impl_(std::make_unique<Impl>()) {
             &levels[1], 1, D3D11_SDK_VERSION, x.device.put(), &actual, x.immediate.put());
     }
     winrt::check_hresult(hr);
+    if (x.immediate) {
+        x.multithread = x.immediate.try_as<ID3D11Multithread>();
+        if (x.multithread) {
+            x.multithread->SetMultithreadProtected(TRUE);
+        }
+    }
     x.load_wgl();
     com_ptr<IDXGIDevice> dxgi = x.device.as<IDXGIDevice>();
     com_ptr<::IInspectable> inspectable;
@@ -295,7 +318,11 @@ CaptureEngine::CaptureEngine(HWND hwnd) : impl_(std::make_unique<Impl>()) {
     x.pool_size = size;
     x.pool = WGC::Direct3D11CaptureFramePool::CreateFreeThreaded(x.winrt_device,
         winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
-    x.token = x.pool.FrameArrived([&x](auto const& pool, auto const&) { x.arrive(pool); });
+    x.token = x.pool.FrameArrived([weak = std::weak_ptr<Impl>(impl_)](auto const& pool, auto const&) {
+        if (auto self = weak.lock()) {
+            self->arrive(pool);
+        }
+    });
     x.session = x.pool.CreateCaptureSession(x.item);
     // The mod draws a single reticle-aligned cursor in the Minecraft HUD.
     // Capturing the desktop cursor as well produces a second, unrelated pointer.
@@ -303,7 +330,9 @@ CaptureEngine::CaptureEngine(HWND hwnd) : impl_(std::make_unique<Impl>()) {
     x.session.StartCapture();
 }
 CaptureEngine::~CaptureEngine() {
+    if (!impl_) return;
     auto& x = *impl_;
+    x.closing.store(true, std::memory_order_release);
     // WGC Close can wait for an in-flight FrameArrived callback. This destructor
     // runs on a daemon cleanup thread, and each Close is guarded so driver/session
     // teardown errors never escape a C++ destructor into process termination.
@@ -311,27 +340,27 @@ CaptureEngine::~CaptureEngine() {
     try { if (x.session) x.session.Close(); } catch (...) { }
     try { if (x.pool) x.pool.Close(); } catch (...) { }
     std::lock_guard guard(x.mutex);
-    // If the driver did not release an interop object, do not unregister or
-    // close a still-locked handle. Keep the backing resources alive until exit.
-    if (!x.release_binding()) {
-        impl_.release();
-        return;
+    x.release_binding();
+    if (x.wgl_device) {
+        if (x.close) x.close(x.wgl_device);
+        x.wgl_device = nullptr;
     }
-    if (x.wgl_device && !x.close(x.wgl_device)) {
-        impl_.release();
-        return;
-    }
-    x.wgl_device = nullptr;
 }
 int CaptureEngine::update(unsigned int gl_texture) {
     auto& x = *impl_;
     require(wglGetCurrentContext() != nullptr, "update requires active OpenGL context");
     require(gl_texture != 0 && glIsTexture(gl_texture), "GL texture name must exist on render thread");
+    if (!x.device || FAILED(x.device->GetDeviceRemovedReason())) {
+        throw std::runtime_error("Direct3D 11 device removed or lost");
+    }
     std::lock_guard guard(x.mutex);
-    if (x.locked) { require(x.unlock(x.wgl_device, 1, &x.wgl_object) != 0, "interop unlock failed"); x.locked = false; }
+    if (x.locked) {
+        if (x.unlock) x.unlock(x.wgl_device, 1, &x.wgl_object);
+        x.locked = false;
+    }
     if (!x.pending) return 0;
     if (x.target_w != x.pending_w || x.target_h != x.pending_h || x.texture != gl_texture) {
-        require(x.release_binding(), "WGL interop resource release failed");
+        x.release_binding();
         x.target = Impl::make_texture(x.device.get(), x.pending_w, x.pending_h);
         x.target_w = x.pending_w; x.target_h = x.pending_h;
         x.texture = gl_texture;
@@ -341,6 +370,7 @@ int CaptureEngine::update(unsigned int gl_texture) {
     }
     bool changed = x.displayed != x.serial;
     if (changed) {
+        if (!x.target || !x.pending) return 0;
         x.immediate->CopyResource(x.target.get(), x.pending.get());
         x.immediate->Flush();
         x.displayed = x.serial;
@@ -351,15 +381,21 @@ int CaptureEngine::update(unsigned int gl_texture) {
 }
 void CaptureEngine::unlock() {
     auto& x = *impl_;
-    if (x.locked) { require(x.unlock(x.wgl_device, 1, &x.wgl_object) != 0, "interop unlock failed"); x.locked = false; }
+    std::lock_guard guard(x.mutex);
+    if (x.locked) {
+        if (x.wgl_device && x.wgl_object && x.unlock) {
+            x.unlock(x.wgl_device, 1, &x.wgl_object);
+        }
+        x.locked = false;
+    }
 }
 void CaptureEngine::detach_gl() {
     auto& x = *impl_;
     require(wglGetCurrentContext() != nullptr, "GL interop teardown requires active OpenGL context");
     std::lock_guard guard(x.mutex);
-    require(x.release_binding(), "WGL interop resource release failed during teardown");
+    x.release_binding();
     if (x.wgl_device) {
-        require(x.close(x.wgl_device) != 0, "WGL device close failed during teardown");
+        if (x.close) x.close(x.wgl_device);
         x.wgl_device = nullptr;
     }
 }
