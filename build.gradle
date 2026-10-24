@@ -1,7 +1,7 @@
 plugins { id 'net.fabricmc.fabric-loom' version '1.17.21' }
 version = project.mod_version
 group = 'com.wincraft'
-base { archivesName = 'wincraft-desktop' }
+base { archivesName = "wincraft-desktop-mc${minecraft_version}" }
 repositories { maven { url = 'https://maven.fabricmc.net/' } }
 dependencies {
     minecraft "com.mojang:minecraft:${minecraft_version}"
@@ -10,10 +10,21 @@ dependencies {
 }
 java { toolchain { languageVersion = JavaLanguageVersion.of(25) }; withSourcesJar() }
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8'; options.release = 25 }
-processResources { inputs.property 'version', version; filesMatching('fabric.mod.json') { expand version: version } }
+processResources {
+    inputs.property 'version', version
+    inputs.property 'minecraft_version', minecraft_version
+    filesMatching('fabric.mod.json') { expand version: version, minecraft_version: minecraft_version }
+}
 // Native is built separately on Windows. Fail clearly instead of shipping a JAR with no DLL.
 def dll = file('src/main/resources/natives/windows-x86_64/wincraft_native.dll')
 tasks.register('verifyNative') {
-    doLast { if (!dll.isFile()) throw new GradleException('Build native DLL first: cmake -S src/native -B native-build -A x64; cmake --build native-build --config Release; copy native-build\\Release\\wincraft_native.dll to src\\main\\resources\\natives\\windows-x86_64\\') }
+    doLast { if (!dll.isFile()) throw new GradleException('Build native DLL first: cmake -S src/native -B native-build -A x64; cmake --build native-build --config Release; copy native-build\\\\Release\\\\wincraft_native.dll to src\\\\main\\\\resources\\\\natives\\\\windows-x86_64\\\\') }
 }
 tasks.named('processResources') { dependsOn 'verifyNative' }
+
+// To build for a specific MC version, pass properties:
+//   gradlew build -Pminecraft_version=26.2 -Pfabric_api_version=0.161.0+26.2
+//   gradlew build -Pminecraft_version=26.3 -Pfabric_api_version=0.161.0+26.3
+// Or load the version-specific property files:
+//   gradlew build --project-prop-file gradle-26.2.properties
+//   gradlew build --project-prop-file gradle-26.3.properties
