@@ -31,16 +31,21 @@ import net.minecraft.network.chat.Component;
  * running window enumeration, spatial panel controls, and file transfer.
  */
 public final class AppLauncherScreen extends Screen {
-    public enum Tab { WINDOWS, APPS, PANELS }
+    public enum Tab { WINDOWS, APPS, TRAY, PANELS }
 
     private Tab currentTab = Tab.WINDOWS;
     private String selectedCategory = "All";
 
     private List<WindowHandleInfo> allWindows = List.of();
     private List<InstalledAppInfo> allApps = List.of();
+    private List<InstalledAppInfo> allTrayApps = List.of();
 
     private List<WindowHandleInfo> filteredWindows = List.of();
     private List<InstalledAppInfo> filteredApps = List.of();
+    private List<InstalledAppInfo> filteredTrayApps = List.of();
+
+    /** Which tray icon grid cell is hovered (-1 = none) */
+    private int hoveredTrayIndex = -1;
 
     private int scrollOffset = 0;
     private int selectedIndex = -1;
@@ -107,7 +112,8 @@ public final class AppLauncherScreen extends Screen {
         // Side-rail tab buttons
         button((currentTab == Tab.WINDOWS ? "● " : "") + "Win", left, top + 20, railW, 22, () -> setTab(Tab.WINDOWS));
         button((currentTab == Tab.APPS ? "● " : "") + "App", left, top + 46, railW, 22, () -> setTab(Tab.APPS));
-        button((currentTab == Tab.PANELS ? "● " : "") + "Scr", left, top + 72, railW, 22, () -> setTab(Tab.PANELS));
+        button((currentTab == Tab.TRAY ? "● " : "") + "Tray", left, top + 72, railW, 22, () -> setTab(Tab.TRAY));
+        button((currentTab == Tab.PANELS ? "● " : "") + "Scr", left, top + 98, railW, 22, () -> setTab(Tab.PANELS));
 
         // Search box
         int searchY = top + 16;
@@ -127,7 +133,7 @@ public final class AppLauncherScreen extends Screen {
 
         // Categories bar for APPS tab
         if (currentTab == Tab.APPS) {
-            String[] cats = {"All", "Browsers", "Development", "Media", "Utilities", "Games"};
+            String[] cats = {"All", "Browsers", "Development", "Social", "Media", "Utilities", "Games"};
             int catW = (contentW - 10) / cats.length;
             for (int i = 0; i < cats.length; i++) {
                 final String cat = cats[i];
@@ -204,6 +210,21 @@ public final class AppLauncherScreen extends Screen {
                     rebuildWidgets();
                 });
             }
+        } else if (currentTab == Tab.TRAY) {
+            // TRAY: icon grid — each cell is TRAY_CELL x TRAY_CELL px, TRAY_COLS per row
+            int cellSize = 36;
+            int cols = Math.max(1, contentW / cellSize);
+            int count = filteredTrayApps.size();
+            for (int i = 0; i < count; i++) {
+                final int idx = i;
+                int col = i % cols;
+                int row = i / cols;
+                int cx = contentLeft + col * cellSize;
+                int cy = listY + row * cellSize;
+                // Invisible hit-area button the size of the icon cell
+                addRenderableWidget(Button.builder(Component.literal(""), b -> launchTrayApp(idx))
+                    .bounds(cx, cy, cellSize - 2, cellSize - 2).build());
+            }
         }
 
         int actionsY = listY + rows * itemH + 3;
@@ -232,6 +253,10 @@ public final class AppLauncherScreen extends Screen {
         } else if (currentTab == Tab.APPS) {
             button("Browse .exe", contentLeft + 112, actionsY, 84, this::launchExe);
             button("Launch & Place Screen", contentLeft + 200, actionsY, contentW - 200, this::launchSelectedApp);
+        } else if (currentTab == Tab.TRAY) {
+            button("Click icon above to show in Minecraft", contentLeft + 112, actionsY, contentW - 112, () -> {
+                status = "Click a tray icon cell above to show that app's window in Minecraft.";
+            });
         } else if (currentTab == Tab.PANELS && selectedPanel != null) {
             button("Snap", contentLeft + 112, actionsY, 48, () -> {
                 WindowControlOverlay.snapToGrid(selectedPanel);
@@ -317,6 +342,66 @@ public final class AppLauncherScreen extends Screen {
                     drawAppIcon(graphics, x, y, hwnd == 0 ? path : "hwnd:" + Long.toUnsignedString(hwnd),
                         path, hwnd, app.category());
                 }
+                case TRAY -> {
+                    // Tray tab draws its own grid — skip row-based rendering
+                }
+            }
+        }
+        // Draw tray grid separately
+        if (currentTab == Tab.TRAY) drawTrayGrid(graphics);
+    }
+
+    /** Renders the System Tray icon grid — Windows overflow-panel style. */
+    private void drawTrayGrid(GuiGraphicsExtractor graphics) {
+        int cellSize = 36;
+        int iconSize = 24;
+        int cols = Math.max(1, listWidth / cellSize);
+        int count = filteredTrayApps.size();
+
+        if (count == 0) {
+            graphics.text(font, "No tray apps detected. Press Refresh.", listLeft, listTop + 8, MUTED, false);
+            return;
+        }
+
+        // Header label
+        graphics.text(font, "\u25A0 System Tray  (" + count + ")", listLeft, listTop - 12, 0xFF8BC8F0, false);
+
+        for (int i = 0; i < count; i++) {
+            InstalledAppInfo app = filteredTrayApps.get(i);
+            int col = i % cols;
+            int row = i / cols;
+            int cx = listLeft + col * cellSize;
+            int cy = listTop + row * cellSize;
+
+            // Cell background: highlight hovered
+            boolean hovered = (i == hoveredTrayIndex);
+            int cellBg = hovered ? 0xFF1E3650 : 0xFF141B25;
+            int border  = hovered ? ACCENT      : 0xFF252F3E;
+            graphics.fill(cx, cy, cx + cellSize - 2, cy + cellSize - 2, cellBg);
+            // thin border
+            graphics.fill(cx, cy, cx + cellSize - 2, cy + 1, border);
+            graphics.fill(cx, cy, cx + 1, cy + cellSize - 2, border);
+            graphics.fill(cx + cellSize - 3, cy, cx + cellSize - 2, cy + cellSize - 2, border);
+            graphics.fill(cx, cy + cellSize - 3, cx + cellSize - 2, cy + cellSize - 2, border);
+
+            // Draw icon centred in cell
+            int ix = cx + (cellSize - 2 - iconSize) / 2;
+            int iy = cy + (cellSize - 2 - iconSize) / 2;
+            long hwnd = runningWindowHandle(app);
+            String path = app.exePath().isBlank() ? app.shortcutPath() : app.exePath();
+            String cacheKey = hwnd != 0 ? "hwnd:" + Long.toUnsignedString(hwnd) : path;
+            Identifier tex = iconTexture(cacheKey, path, hwnd);
+            if (tex != null) {
+                graphics.blit(RenderPipelines.GUI_TEXTURED, tex, ix, iy, iconSize, iconSize, 0, 0, 32, 32, 32, 32);
+            } else {
+                // Fallback: coloured dot
+                drawCategoryIcon(graphics, ix + 4, iy + 4, app.category());
+            }
+
+            // Tooltip on hover — name below the grid
+            if (hovered) {
+                int gridRows = (count + cols - 1) / cols;
+                graphics.text(font, "\u25B6 " + app.name(), listLeft, listTop + gridRows * cellSize + 4, 0xFFF2FAFF, false);
             }
         }
     }
@@ -459,18 +544,30 @@ public final class AppLauncherScreen extends Screen {
             List<InstalledAppInfo> apps = new ArrayList<>(NativeCaptureBridge.enumerateInstalledApps());
             Set<String> knownNames = new HashSet<>();
             apps.forEach(app -> knownNames.add(app.name().toLowerCase(Locale.ROOT)));
+            // Separate tray-only apps (have no start-menu shortcut, detected from system tray)
+            List<InstalledAppInfo> tray = new ArrayList<>();
+            List<InstalledAppInfo> regularApps = new ArrayList<>();
+            for (InstalledAppInfo a : apps) {
+                if (a.category().equals("Tray") || (a.shortcutPath().isBlank() && a.exePath().isBlank())) {
+                    tray.add(a);
+                } else {
+                    regularApps.add(a);
+                }
+            }
             int runningAdded = 0;
             for (WindowHandleInfo window : allWindows) {
                 if (WinCraftClient.isMinecraftWindow(window.hwnd())) continue;
                 String name = window.title().trim();
                 if (name.isEmpty() || !knownNames.add(name.toLowerCase(Locale.ROOT))) continue;
-                apps.add(new InstalledAppInfo(name, "", "Running windows", "hwnd:" + Long.toUnsignedString(window.hwnd())));
+                regularApps.add(new InstalledAppInfo(name, "", "Running windows", "hwnd:" + Long.toUnsignedString(window.hwnd())));
                 runningAdded++;
             }
-            allApps = List.copyOf(apps);
-            status = "Found " + (allApps.size() - runningAdded) + " installed apps and " + runningAdded + " running windows.";
+            allApps = List.copyOf(regularApps);
+            allTrayApps = List.copyOf(tray);
+            status = "Found " + (allApps.size() - runningAdded) + " installed apps, " + runningAdded + " running windows, " + tray.size() + " tray apps.";
         } catch (RuntimeException | LinkageError e) {
             allApps = List.of();
+            allTrayApps = List.of();
             status = "App discovery failed: " + e.getMessage();
         }
         dataLoaded = true;
@@ -486,6 +583,7 @@ public final class AppLauncherScreen extends Screen {
         return switch (currentTab) {
             case WINDOWS -> filteredWindows.size();
             case APPS -> filteredApps.size();
+            case TRAY -> filteredTrayApps.size();
             case PANELS -> WinCraftClient.surfaces().size();
         };
     }
@@ -534,6 +632,10 @@ public final class AppLauncherScreen extends Screen {
                         "hwnd:" + Long.toUnsignedString(w.hwnd())))
                     .toList();
             }
+        } else if (currentTab == Tab.TRAY) {
+            filteredTrayApps = allTrayApps.stream().filter(a ->
+                q.isEmpty() || a.name().toLowerCase(Locale.ROOT).contains(q)
+            ).toList();
         }
     }
 
@@ -808,6 +910,75 @@ public final class AppLauncherScreen extends Screen {
     }
 
     @Override public boolean isPauseScreen() { return false; }
+
+    @Override
+    public void mouseMoved(double mouseX, double mouseY) {
+        if (currentTab == Tab.TRAY && listWidth > 0) {
+            int cellSize = 36;
+            int cols = Math.max(1, listWidth / cellSize);
+            int count = filteredTrayApps.size();
+            int newHover = -1;
+            for (int i = 0; i < count; i++) {
+                int col = i % cols;
+                int row = i / cols;
+                int cx = listLeft + col * cellSize;
+                int cy = listTop + row * cellSize;
+                if (mouseX >= cx && mouseX < cx + cellSize - 2 && mouseY >= cy && mouseY < cy + cellSize - 2) {
+                    newHover = i;
+                    break;
+                }
+            }
+            if (newHover != hoveredTrayIndex) {
+                hoveredTrayIndex = newHover;
+                // Update status with hovered app name
+                if (newHover >= 0) {
+                    status = "Tray: " + filteredTrayApps.get(newHover).name() + " — click to show window";
+                }
+            }
+        } else {
+            hoveredTrayIndex = -1;
+        }
+        super.mouseMoved(mouseX, mouseY);
+    }
+
+    private void launchTrayApp(int idx) {
+        if (idx < 0 || idx >= filteredTrayApps.size()) return;
+        InstalledAppInfo app = filteredTrayApps.get(idx);
+
+        // Try to find an existing window matching this app
+        String exeName = app.exePath().isBlank() ? "" :
+            java.nio.file.Path.of(app.exePath()).getFileName().toString().toLowerCase(Locale.ROOT);
+        if (exeName.endsWith(".exe")) exeName = exeName.substring(0, exeName.length() - 4);
+
+        final String nameHint = exeName.isBlank() ? app.name().toLowerCase(Locale.ROOT) : exeName;
+        WindowHandleInfo existing = allWindows.stream()
+            .filter(w -> !WinCraftClient.isMinecraftWindow(w.hwnd()))
+            .filter(w -> w.title().toLowerCase(Locale.ROOT).contains(nameHint))
+            .findFirst().orElse(null);
+
+        if (existing != null) {
+            WinCraftClient.placePanel(existing);
+            minecraft.gui.setScreen(null);
+            return;
+        }
+
+        // No window — launch the exe
+        if (!app.exePath().isBlank() || !app.shortcutPath().isBlank()) {
+            try {
+                String launchPath = app.shortcutPath().isBlank() ? app.exePath() : app.shortcutPath();
+                List<WindowHandleInfo> before = NativeCaptureBridge.enumerate();
+                if (!NativeCaptureBridge.launchApplication(launchPath)) {
+                    throw new java.io.IOException("Windows could not open this tray app");
+                }
+                status = "Launched " + app.name() + ". Looking for its window to place...";
+                detectAndOfferWindow(before, app.name());
+            } catch (java.io.IOException | RuntimeException e) {
+                status = "Launch failed: " + e.getMessage();
+            }
+        } else {
+            status = "No launch path available for " + app.name() + ". Open it manually first.";
+        }
+    }
 
     @Override public void removed() {
         for (Identifier id : iconTextures.values()) minecraft.getTextureManager().release(id);
