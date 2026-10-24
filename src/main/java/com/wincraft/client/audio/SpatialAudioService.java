@@ -20,6 +20,7 @@ import org.lwjgl.openal.AL;
 import org.lwjgl.openal.ALCCapabilities;
 import org.lwjgl.openal.ALCapabilities;
 import org.lwjgl.openal.AL10;
+import org.lwjgl.openal.AL11;
 import org.lwjgl.openal.ALC;
 import org.lwjgl.openal.ALC10;
 import org.lwjgl.openal.EXTThreadLocalContext;
@@ -30,6 +31,12 @@ import org.slf4j.LoggerFactory;
  * Multi-panel 3D spatial audio service.
  * Supports independent virtual audio cables for multiple panels concurrently.
  * Audio is downmixed to mono and spatialized with OpenAL.
+ *
+ * Spatial model: AL_LINEAR_DISTANCE_CLAMPED with reference=2 blocks, max=24 blocks.
+ * Sound attenuates linearly from full volume at 2 m to silence at 24 m, and also
+ * pans left/right based on the player's look direction relative to the panel — just
+ * like a real screen in the room with you.
+ *
  * Never records the user's real physical microphone.
  */
 public final class SpatialAudioService {
@@ -37,6 +44,13 @@ public final class SpatialAudioService {
     private static final AudioFormat FORMAT = new AudioFormat(48_000f, 16, 2, true, false);
     private static final int FRAMES = 960; // 20 ms
     private static final int BUFFER_COUNT = 6;
+
+    /** Reference distance in blocks: full volume when closer than this. */
+    private static final float REF_DISTANCE  = 2.0f;
+    /** Maximum distance in blocks: silence beyond this. */
+    private static final float MAX_DISTANCE  = 24.0f;
+    /** Default gain (0..2). 1.0 = unity. */
+    private static final float DEFAULT_GAIN  = 1.0f;
 
     private static final class PanelStream {
         final AppWindowEntity panel;
@@ -46,6 +60,7 @@ public final class SpatialAudioService {
         volatile int source;
         final int[] buffers = new int[BUFFER_COUNT];
         volatile String status;
+        volatile float gain = DEFAULT_GAIN;
         Thread worker;
 
         PanelStream(AppWindowEntity panel, Mixer.Info mixer) {
@@ -121,6 +136,24 @@ public final class SpatialAudioService {
 
     public List<AppWindowEntity> activePanels() {
         return new ArrayList<>(streams.keySet());
+    }
+
+    public float gainFor(AppWindowEntity p) {
+        PanelStream s = streams.get(p);
+        return s != null ? s.gain : DEFAULT_GAIN;
+    }
+
+    public void setGain(AppWindowEntity p, float gain) {
+        PanelStream s = streams.get(p);
+        if (s == null) return;
+        float clamped = Math.clamp(gain, 0f, 2f);
+        s.gain = clamped;
+        synchronized (alLock) {
+            if (alContext == 0 || s.source == 0) return;
+            try (ContextScope ignored = enterOpenALContext()) {
+                AL10.alSourcef(s.source, AL10.AL_GAIN, clamped);
+            }
+        }
     }
 
     public synchronized void start(AppWindowEntity panel, Mixer.Info mixer) {
@@ -206,20 +239,40 @@ public final class SpatialAudioService {
 
     public void stopIfPanel(AppWindowEntity p) { stop(p); }
 
+    /**
+     * Called every frame/tick to update listener and source spatial audio positions.
+     *
+     * @param panel  the panel whose audio source to reposition
+     * @param sx,sy,sz  world position of the panel (audio source)
+     * @param lx,ly,lz  player eye position (listener)
+     * @param fx,fy,fz  player look-direction unit vector (listener "forward" vector)
+     * @param ux,uy,uz  player head up vector (listener "up" vector)
+     */
     public void update(AppWindowEntity panel, float sx, float sy, float sz,
-                       float lx, float ly, float lz, float fx, float fy, float fz) {
+                       float lx, float ly, float lz,
+                       float fx, float fy, float fz,
+                       float ux, float uy, float uz) {
         PanelStream s = streams.get(panel);
         if (s == null || s.source == 0) return;
         synchronized (alLock) {
             if (alContext == 0) return;
             try (ContextScope ignored = enterOpenALContext()) {
+                // Listener position (player eye / camera)
                 AL10.alListener3f(AL10.AL_POSITION, lx, ly, lz);
-                FloatBuffer orientation = BufferUtils.createFloatBuffer(6);
-                orientation.put(fx).put(fy).put(fz).put(0).put(1).put(0).flip();
-                AL10.alListenerfv(AL10.AL_ORIENTATION, orientation);
+                AL10.alListener3f(AL10.AL_VELOCITY, 0f, 0f, 0f);
+                // Listener orientation: forward (at) + up
+                AL10.alListenerfv(AL10.AL_ORIENTATION, new float[]{ fx, fy, fz, ux, uy, uz });
+                // Audio source at the panel's world centre
                 AL10.alSource3f(s.source, AL10.AL_POSITION, sx, sy, sz);
+                AL10.alSource3f(s.source, AL10.AL_VELOCITY, 0f, 0f, 0f);
             }
         }
+    }
+
+    public void update(AppWindowEntity panel, float sx, float sy, float sz,
+                       float lx, float ly, float lz,
+                       float fx, float fy, float fz) {
+        update(panel, sx, sy, sz, lx, ly, lz, fx, fy, fz, 0f, 1f, 0f);
     }
 
     private void ensureOpenAL() {
@@ -324,10 +377,18 @@ public final class SpatialAudioService {
                 synchronized (alLock) {
                     if (!s.running.get()) return;
                     s.source = AL10.alGenSources();
-                    AL10.alSourcei(s.source, AL10.AL_SOURCE_RELATIVE, 0);
-                    AL10.alDistanceModel(AL10.AL_INVERSE_DISTANCE_CLAMPED);
-                    AL10.alSourcef(s.source, AL10.AL_REFERENCE_DISTANCE, 3.0f);
-                    AL10.alSourcef(s.source, AL10.AL_ROLLOFF_FACTOR, 1.0f);
+                    // Absolute world-space source — NOT relative to listener
+                    AL10.alSourcei(s.source, AL10.AL_SOURCE_RELATIVE, AL10.AL_FALSE);
+                    // Linear distance model: full volume at REF_DISTANCE, silence at MAX_DISTANCE
+                    AL10.alDistanceModel(AL11.AL_LINEAR_DISTANCE_CLAMPED);
+                    AL10.alSourcef(s.source, AL10.AL_REFERENCE_DISTANCE, REF_DISTANCE);
+                    AL10.alSourcef(s.source, AL10.AL_MAX_DISTANCE,       MAX_DISTANCE);
+                    AL10.alSourcef(s.source, AL10.AL_ROLLOFF_FACTOR,     1.0f);
+                    AL10.alSourcef(s.source, AL10.AL_GAIN,               s.gain);
+                    AL10.alSource3f(s.source, AL10.AL_VELOCITY,          0f, 0f, 0f);
+                    // Omnidirectional point source (no cone narrowing)
+                    AL10.alSourcef(s.source, AL10.AL_CONE_INNER_ANGLE,   360.0f);
+                    AL10.alSourcef(s.source, AL10.AL_CONE_OUTER_ANGLE,   360.0f);
                     for (int i = 0; i < BUFFER_COUNT; i++) {
                         s.buffers[i] = AL10.alGenBuffers();
                         free.add(s.buffers[i]);

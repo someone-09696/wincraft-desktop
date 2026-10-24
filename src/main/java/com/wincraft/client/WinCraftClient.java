@@ -42,7 +42,47 @@ public final class WinCraftClient implements ClientModInitializer {
     public static void setHelpHudEnabled(boolean enabled) { helpHudEnabled = enabled; }
     public static void reportRendererStatus(String status) { rendererStatus = status; }
     public static void renderPanelsAfterPostProcessing(RenderTarget target) {
+        updateSpatialAudio();
         RENDERER.renderAfterPostProcessing(target);
+    }
+
+    public static void updateSpatialAudio() {
+        if (AUDIO.activePanels().isEmpty()) return;
+        var mc = net.minecraft.client.Minecraft.getInstance();
+        if (mc.level == null || mc.player == null) return;
+
+        float lx, ly, lz, fx, fy, fz, ux = 0f, uy = 1f, uz = 0f;
+        com.mojang.blaze3d.audio.ListenerTransform lt = null;
+        try {
+            if (mc.getSoundManager() != null) {
+                lt = mc.getSoundManager().getListenerTransform();
+            }
+        } catch (RuntimeException ignored) { }
+
+        if (lt != null) {
+            Vec3 p = lt.position();
+            Vec3 f = lt.forward();
+            Vec3 u = lt.up();
+            lx = (float) p.x; ly = (float) p.y; lz = (float) p.z;
+            fx = (float) f.x; fy = (float) f.y; fz = (float) f.z;
+            ux = (float) u.x; uy = (float) u.y; uz = (float) u.z;
+        } else {
+            Vec3 eye = mc.player.getEyePosition();
+            Vec3 look = mc.player.getLookAngle();
+            lx = (float) eye.x; ly = (float) eye.y; lz = (float) eye.z;
+            fx = (float) look.x; fy = (float) look.y; fz = (float) look.z;
+        }
+
+        for (AppWindowEntity panel : PANELS) {
+            if (AUDIO.activeFor(panel)) {
+                org.joml.Vector3d src = panel.transform.position;
+                AUDIO.update(panel,
+                    (float) src.x, (float) src.y, (float) src.z,
+                    lx, ly, lz,
+                    fx, fy, fz,
+                    ux, uy, uz);
+            }
+        }
     }
     public static boolean isMinecraftWindow(long hwnd) {
         var mc = net.minecraft.client.Minecraft.getInstance();
@@ -96,6 +136,7 @@ public final class WinCraftClient implements ClientModInitializer {
                 for (AppWindowEntity panel : PANELS) {
                     panel.transform.updateCameraPose(eyePos, direction, mc.player.getYRot(), mc.player.getXRot());
                 }
+                updateSpatialAudio();
             }
             // Poll owned dialogs often enough that ordinary app popups appear
             // in-world promptly, without enumerating the desktop every tick.
