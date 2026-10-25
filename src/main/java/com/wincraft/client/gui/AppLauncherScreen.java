@@ -548,8 +548,9 @@ public final class AppLauncherScreen extends Screen {
             List<InstalledAppInfo> tray = new ArrayList<>();
             List<InstalledAppInfo> regularApps = new ArrayList<>();
             for (InstalledAppInfo a : apps) {
-                if (a.category().equals("Tray") || (a.shortcutPath().isBlank() && a.exePath().isBlank())) {
+                if (a.category().equalsIgnoreCase("Tray")) {
                     tray.add(a);
+                    regularApps.add(new InstalledAppInfo(a.name(), a.exePath(), "Social", a.shortcutPath()));
                 } else {
                     regularApps.add(a);
                 }
@@ -669,16 +670,20 @@ public final class AppLauncherScreen extends Screen {
                 return;
             }
             List<WindowHandleInfo> before = NativeCaptureBridge.enumerate();
-            String executableName = java.nio.file.Path.of(app.exePath().isBlank()
-                ? app.shortcutPath() : app.exePath()).getFileName().toString();
-            if (hasChromiumBackgroundFlags(executableName) && !app.exePath().isBlank()) {
+            String launchPath = app.shortcutPath().isBlank() ? app.exePath() : app.shortcutPath();
+            String executableName = "";
+            if (!launchPath.startsWith("shell:") && !launchPath.contains("!")) {
+                try {
+                    executableName = java.nio.file.Path.of(launchPath).getFileName().toString();
+                } catch (Exception ignored) { }
+            }
+            if (!executableName.isBlank() && hasChromiumBackgroundFlags(executableName) && !app.exePath().isBlank()) {
                 if (!NativeCaptureBridge.launchApplication(app.exePath(), chromiumBackgroundArguments())) {
                     throw new IOException("Windows could not open this app");
                 }
             } else {
-                String launchPath = app.shortcutPath().isBlank() ? app.exePath() : app.shortcutPath();
                 if (!NativeCaptureBridge.launchApplication(launchPath)) {
-                    throw new IOException("Windows could not open this app shortcut");
+                    throw new IOException("Windows could not open this app");
                 }
             }
             status = "Launched " + app.name() + ". Looking for its window to place...";
@@ -946,9 +951,14 @@ public final class AppLauncherScreen extends Screen {
         InstalledAppInfo app = filteredTrayApps.get(idx);
 
         // Try to find an existing window matching this app
-        String exeName = app.exePath().isBlank() ? "" :
-            java.nio.file.Path.of(app.exePath()).getFileName().toString().toLowerCase(Locale.ROOT);
-        if (exeName.endsWith(".exe")) exeName = exeName.substring(0, exeName.length() - 4);
+        String exeName = "";
+        String p = app.exePath().isBlank() ? app.shortcutPath() : app.exePath();
+        if (!p.startsWith("shell:") && !p.contains("!")) {
+            try {
+                exeName = java.nio.file.Path.of(p).getFileName().toString().toLowerCase(Locale.ROOT);
+                if (exeName.endsWith(".exe")) exeName = exeName.substring(0, exeName.length() - 4);
+            } catch (Exception ignored) { }
+        }
 
         final String nameHint = exeName.isBlank() ? app.name().toLowerCase(Locale.ROOT) : exeName;
         WindowHandleInfo existing = allWindows.stream()

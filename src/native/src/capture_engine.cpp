@@ -32,6 +32,47 @@ using LockObjects = BOOL (WINAPI*)(HANDLE, GLint, HANDLE*);
 using UnlockObjects = BOOL (WINAPI*)(HANDLE, GLint, HANDLE*);
 constexpr GLenum ACCESS_READ_ONLY = 0x0000;
 
+// Direct3D 11 operations can throw Win32 SEH exceptions (e.g. 0xC0000005 ACCESS_VIOLATION)
+// when an application window suddenly closes, resizes, or resets its DirectX device.
+// C++ catch (...) does NOT catch Win32 SEH exceptions on MSVC; we use dedicated __try/__except wrappers.
+static bool safe_copy_resource(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src) {
+    if (!ctx || !dst || !src) return false;
+    __try {
+        ctx->CopyResource(dst, src);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool safe_flush(ID3D11DeviceContext* ctx) {
+    if (!ctx) return false;
+    __try {
+        ctx->Flush();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool safe_unlock(UnlockObjects unlock_fn, HANDLE wgl_dev, HANDLE wgl_obj) {
+    if (!unlock_fn || !wgl_dev || !wgl_obj) return false;
+    __try {
+        return unlock_fn(wgl_dev, 1, &wgl_obj) != FALSE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool safe_lock(LockObjects lock_fn, HANDLE wgl_dev, HANDLE wgl_obj) {
+    if (!lock_fn || !wgl_dev || !wgl_obj) return false;
+    __try {
+        return lock_fn(wgl_dev, 1, &wgl_obj) != FALSE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 std::vector<WindowInfo> enumerate_windows() {
     std::vector<WindowInfo> result;
     EnumWindows([](HWND hwnd, LPARAM arg) -> BOOL {
@@ -181,6 +222,8 @@ struct CaptureEngine::Impl {
     com_ptr<ID3D11Texture2D> target;
     unsigned long long serial = 0, displayed = 0;
     int pending_w = 0, pending_h = 0, target_w = 0, target_h = 0;
+    DXGI_FORMAT pending_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    DXGI_FORMAT target_format = DXGI_FORMAT_B8G8R8A8_UNORM;
     OpenDevice open{}; CloseDevice close{}; RegisterObject reg{}; UnregisterObject unreg{};
     LockObjects lock{}; UnlockObjects unlock{};
     HANDLE wgl_device{}, wgl_object{};
@@ -189,14 +232,16 @@ struct CaptureEngine::Impl {
 
     winrt::Windows::Graphics::SizeInt32 pool_size{};
 
-    static com_ptr<ID3D11Texture2D> make_texture(ID3D11Device* d, int w, int h) {
+    static com_ptr<ID3D11Texture2D> make_texture(ID3D11Device* d, int w, int h, DXGI_FORMAT fmt = DXGI_FORMAT_B8G8R8A8_UNORM) {
+        if (!d || w <= 0 || h <= 0) return nullptr;
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = static_cast<UINT>(w); desc.Height = static_cast<UINT>(h);
-        desc.MipLevels = 1; desc.ArraySize = 1; desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.MipLevels = 1; desc.ArraySize = 1; desc.Format = fmt;
         desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         com_ptr<ID3D11Texture2D> out;
-        winrt::check_hresult(d->CreateTexture2D(&desc, nullptr, out.put()));
+        HRESULT hr = d->CreateTexture2D(&desc, nullptr, out.put());
+        if (FAILED(hr)) return nullptr;
         return out;
     }
     void arrive(WGC::Direct3D11CaptureFramePool const& sender) {
@@ -209,23 +254,28 @@ struct CaptureEngine::Impl {
             if (size.Width > 0 && size.Height > 0 && size.Width <= 16384 && size.Height <= 16384) {
                 auto access = frame.Surface().as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
                 com_ptr<ID3D11Texture2D> source;
-                winrt::check_hresult(access->GetInterface(__uuidof(ID3D11Texture2D), source.put_void()));
-                D3D11_TEXTURE2D_DESC source_desc{};
-                source->GetDesc(&source_desc);
-                // During resize, WGC can report new content dimensions while the pool
-                // still supplies an old-sized texture. Recreate the pool; skip that frame.
-                if (source_desc.Width == static_cast<UINT>(size.Width) &&
-                    source_desc.Height == static_cast<UINT>(size.Height)) {
-                    std::lock_guard guard(mutex);
-                    if (!closing.load(std::memory_order_acquire)) {
-                        if (device && SUCCEEDED(device->GetDeviceRemovedReason())) {
-                            if (pending_w != size.Width || pending_h != size.Height) {
-                                pending = make_texture(device.get(), size.Width, size.Height);
-                                pending_w = size.Width; pending_h = size.Height;
-                            }
-                            if (pending && source) {
-                                immediate->CopyResource(pending.get(), source.get());
-                                ++serial;
+                HRESULT hr = access->GetInterface(__uuidof(ID3D11Texture2D), source.put_void());
+                if (SUCCEEDED(hr) && source) {
+                    D3D11_TEXTURE2D_DESC source_desc{};
+                    source->GetDesc(&source_desc);
+                    // During resize, WGC can report new content dimensions while the pool
+                    // still supplies an old-sized texture. Recreate the pool; skip that frame.
+                    if (source_desc.Width == static_cast<UINT>(size.Width) &&
+                        source_desc.Height == static_cast<UINT>(size.Height)) {
+                        std::lock_guard guard(mutex);
+                        if (!closing.load(std::memory_order_acquire)) {
+                            if (device && SUCCEEDED(device->GetDeviceRemovedReason())) {
+                                if (pending_w != size.Width || pending_h != size.Height || pending_format != source_desc.Format) {
+                                    pending = make_texture(device.get(), size.Width, size.Height, source_desc.Format);
+                                    pending_w = size.Width;
+                                    pending_h = size.Height;
+                                    pending_format = source_desc.Format;
+                                }
+                                if (pending && source) {
+                                    if (safe_copy_resource(immediate.get(), pending.get(), source.get())) {
+                                        ++serial;
+                                    }
+                                }
                             }
                         }
                     }
@@ -257,9 +307,7 @@ struct CaptureEngine::Impl {
     }
     bool release_binding() {
         if (locked) {
-            if (wgl_device && wgl_object && unlock) {
-                unlock(wgl_device, 1, &wgl_object);
-            }
+            safe_unlock(unlock, wgl_device, wgl_object);
             locked = false;
         }
         if (wgl_object) {
@@ -355,37 +403,38 @@ int CaptureEngine::update(unsigned int gl_texture) {
     }
     std::lock_guard guard(x.mutex);
     if (x.locked) {
-        if (x.unlock) x.unlock(x.wgl_device, 1, &x.wgl_object);
+        safe_unlock(x.unlock, x.wgl_device, x.wgl_object);
         x.locked = false;
     }
     if (!x.pending) return 0;
-    if (x.target_w != x.pending_w || x.target_h != x.pending_h || x.texture != gl_texture) {
+    if (x.target_w != x.pending_w || x.target_h != x.pending_h || x.target_format != x.pending_format || x.texture != gl_texture) {
         x.release_binding();
-        x.target = Impl::make_texture(x.device.get(), x.pending_w, x.pending_h);
-        x.target_w = x.pending_w; x.target_h = x.pending_h;
+        x.target = Impl::make_texture(x.device.get(), x.pending_w, x.pending_h, x.pending_format);
+        if (!x.target) return 0;
+        x.target_w = x.pending_w; x.target_h = x.pending_h; x.target_format = x.pending_format;
         x.texture = gl_texture;
         x.wgl_object = x.reg(x.wgl_device, x.target.get(), gl_texture, GL_TEXTURE_2D, ACCESS_READ_ONLY);
-        require(x.wgl_object != nullptr, "WGL texture registration failed; use OpenGL on same adapter");
+        if (!x.wgl_object) return 0;
         x.displayed = 0;
     }
     bool changed = x.displayed != x.serial;
     if (changed) {
         if (!x.target || !x.pending) return 0;
-        x.immediate->CopyResource(x.target.get(), x.pending.get());
-        x.immediate->Flush();
-        x.displayed = x.serial;
+        if (safe_copy_resource(x.immediate.get(), x.target.get(), x.pending.get())) {
+            safe_flush(x.immediate.get());
+            x.displayed = x.serial;
+        }
     }
-    require(x.lock(x.wgl_device, 1, &x.wgl_object) != 0, "interop lock failed");
-    x.locked = true;  // GL may sample only until unlock(), even if no frame changed.
+    if (safe_lock(x.lock, x.wgl_device, x.wgl_object)) {
+        x.locked = true;  // GL may sample only until unlock(), even if no frame changed.
+    }
     return changed ? 1 : 0;
 }
 void CaptureEngine::unlock() {
     auto& x = *impl_;
     std::lock_guard guard(x.mutex);
     if (x.locked) {
-        if (x.wgl_device && x.wgl_object && x.unlock) {
-            x.unlock(x.wgl_device, 1, &x.wgl_object);
-        }
+        safe_unlock(x.unlock, x.wgl_device, x.wgl_object);
         x.locked = false;
     }
 }

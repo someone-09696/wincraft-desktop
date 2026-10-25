@@ -202,12 +202,16 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_wincraft_client_bridge_NativeCaptu
 extern "C" JNIEXPORT jboolean JNICALL Java_com_wincraft_client_bridge_NativeCaptureBridge_nLaunchApplication(JNIEnv* env, jclass, jstring jpath) {
     std::wstring path = jstring_to_wstring(env, jpath);
     if (path.empty()) return JNI_FALSE;
+    std::wstring target_path = path;
+    if (target_path.find(L":") == std::wstring::npos && target_path.find(L"!") != std::wstring::npos) {
+        target_path = L"shell:AppsFolder\\" + target_path;
+    }
     SHELLEXECUTEINFOW request{};
     request.cbSize = sizeof(request);
     request.fMask = SEE_MASK_FLAG_NO_UI;
     request.lpVerb = L"open";
-    request.lpFile = path.c_str();
-    request.nShow = SW_SHOWNOACTIVATE;
+    request.lpFile = target_path.c_str();
+    request.nShow = SW_SHOWNORMAL;
     return ShellExecuteExW(&request) ? JNI_TRUE : JNI_FALSE;
 }
 

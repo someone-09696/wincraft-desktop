@@ -359,6 +359,10 @@ std::vector<InstalledAppInfo> enumerate_installed_apps() {
     auto add_app = [&](const std::wstring& name, const std::wstring& exe_path,
                        const std::wstring& shortcut_path, const std::wstring& category) {
         if (name.empty() || (exe_path.empty() && shortcut_path.empty())) return;
+        if (category == L"Tray") {
+            apps.push_back({name, exe_path, category, shortcut_path});
+            return;
+        }
         std::wstring lower_name = to_lower(name);
         if (seen_names.count(lower_name)) return;
         std::wstring lower_exe = to_lower(exe_path);
@@ -477,6 +481,56 @@ std::vector<InstalledAppInfo> enumerate_installed_apps() {
     add_builtin(L"Calculator", L"System32\\calc.exe", L"Utilities");
     add_builtin(L"Task Manager", L"System32\\Taskmgr.exe", L"Utilities");
 
+    // Scan modern Windows Store / UWP / Packaged apps (WhatsApp, Spotify, Instagram, Netflix, etc.)
+    auto scan_apps_folder = [&]() {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        // FOLDERID_AppsFolder: {1e87508d-89c2-42f0-8a7e-64364184c360}
+        const GUID kFolderIdApps = { 0x1e87508d, 0x89c2, 0x42f0, { 0x8a, 0x7e, 0x64, 0x36, 0x41, 0x84, 0xc3, 0x60 } };
+        if (FAILED(SHGetKnownFolderIDList(kFolderIdApps, 0, nullptr, &pidl)) || !pidl) {
+            return;
+        }
+
+        winrt::com_ptr<IShellItem> apps_folder;
+        if (SUCCEEDED(SHCreateItemFromIDList(pidl, IID_PPV_ARGS(apps_folder.put())))) {
+            winrt::com_ptr<IEnumShellItems> enum_items;
+            if (SUCCEEDED(apps_folder->BindToHandler(nullptr, BHID_EnumItems, IID_PPV_ARGS(enum_items.put())))) {
+                winrt::com_ptr<IShellItem> item;
+                ULONG fetched = 0;
+                while (enum_items->Next(1, item.put(), &fetched) == S_OK && fetched == 1) {
+                    PWSTR disp_name = nullptr;
+                    if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &disp_name)) && disp_name) {
+                        PWSTR parse_name = nullptr;
+                        if (SUCCEEDED(item->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &parse_name)) && parse_name) {
+                            std::wstring name = disp_name;
+                            std::wstring parsing = parse_name;
+                            std::wstring lower_name = to_lower(name);
+                            if (!name.empty() && !parsing.empty() &&
+                                lower_name.find(L"uninstall") == std::wstring::npos &&
+                                lower_name.find(L"experience host") == std::wstring::npos &&
+                                lower_name.find(L"print dialog") == std::wstring::npos &&
+                                lower_name.find(L"capture picker") == std::wstring::npos &&
+                                lower_name.find(L"windows security") == std::wstring::npos) {
+                                std::wstring cat = categorize_app(name, parsing, L"");
+                                std::wstring launch_path = parsing;
+                                if (launch_path.find(L":") == std::wstring::npos &&
+                                    launch_path.find(L"\\") == std::wstring::npos) {
+                                    launch_path = L"shell:AppsFolder\\" + launch_path;
+                                }
+                                add_app(name, L"", launch_path, cat);
+                            }
+                            CoTaskMemFree(parse_name);
+                        }
+                        CoTaskMemFree(disp_name);
+                    }
+                    item = nullptr;
+                }
+            }
+        }
+        CoTaskMemFree(pidl);
+    };
+
+    scan_apps_folder();
+
     // Add system tray apps (WhatsApp, Discord, Cloudflare WARP, etc.)
     // that don't appear in Start Menu or registry but live in the taskbar tray.
     try {
@@ -497,8 +551,7 @@ std::vector<InstalledAppInfo> enumerate_installed_apps() {
                 lower_name.find(L"show hidden icons") != std::wstring::npos) {
                 continue;
             }
-            std::wstring cat = categorize_app(ti.name, ti.exe_path, L"");
-            add_app(ti.name, ti.exe_path, L"", cat);
+            add_app(ti.name, ti.exe_path, L"", L"Tray");
         }
     } catch (...) {
         // Tray enumeration is best-effort; don't fail the whole function
@@ -529,6 +582,40 @@ std::vector<uint8_t> extract_icon_rgba(const std::wstring& path, HWND hwnd, int 
     }
 
     if (!hIcon && !path.empty()) {
+        if (path.find(L"shell:") == 0 || path.find(L"!") != std::wstring::npos) {
+            winrt::com_ptr<IShellItem> shell_item;
+            std::wstring parse_path = (path.find(L"shell:AppsFolder\\") == 0) ? path : (L"shell:AppsFolder\\" + path);
+            if (SUCCEEDED(SHCreateItemFromParsingName(parse_path.c_str(), nullptr, IID_PPV_ARGS(shell_item.put())))) {
+                winrt::com_ptr<IShellItemImageFactory> img_factory;
+                if (SUCCEEDED(shell_item->QueryInterface(IID_PPV_ARGS(img_factory.put())))) {
+                    HBITMAP hbmp = nullptr;
+                    SIZE sz{size, size};
+                    if (SUCCEEDED(img_factory->GetImage(sz, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &hbmp)) && hbmp) {
+                        HDC hdc = GetDC(nullptr);
+                        BITMAPINFO bi{};
+                        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                        bi.bmiHeader.biWidth = size;
+                        bi.bmiHeader.biHeight = -size; // top-down
+                        bi.bmiHeader.biPlanes = 1;
+                        bi.bmiHeader.biBitCount = 32;
+                        bi.bmiHeader.biCompression = BI_RGB;
+                        std::vector<uint8_t> bgra(size * size * 4);
+                        if (GetDIBits(hdc, hbmp, 0, size, bgra.data(), &bi, DIB_RGB_COLORS)) {
+                            result.resize(size * size * 4);
+                            for (int i = 0; i < size * size; ++i) {
+                                result[i * 4]     = bgra[i * 4 + 2]; // R
+                                result[i * 4 + 1] = bgra[i * 4 + 1]; // G
+                                result[i * 4 + 2] = bgra[i * 4];     // B
+                                result[i * 4 + 3] = bgra[i * 4 + 3]; // A
+                            }
+                        }
+                        ReleaseDC(nullptr, hdc);
+                        DeleteObject(hbmp);
+                        if (!result.empty()) return result;
+                    }
+                }
+            }
+        }
         SHFILEINFOW sfi{};
         if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON) && sfi.hIcon) {
             hIcon = sfi.hIcon;
